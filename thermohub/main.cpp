@@ -1,4 +1,4 @@
-#include "app/adaptive_thermostat_tuning.h"
+#include "app/difftune_thermostat_tuning.h"
 #include "app/pid_thermostat_controller.h"
 #include "commands.h"
 #include "diagnostics/diag.h"
@@ -109,7 +109,8 @@ namespace {
     HubClient                gHubClient(gHubReceiver, gLogger);
     CommandScheduler         gCommandScheduler;
     PidThermostatController  gPid;
-    AdaptiveThermostatTuning gAdaptive;
+    DiffTuneThermostatTuning gDiffTune;   // Hovakimyan et al. DiffTune auto-tuning
+    ThermostatMode           gDiffTuneMode = ThermostatMode::FAST;
 
     float gTargetTempC   = 21.0f;
     bool  gHeaterPowered = true;
@@ -316,6 +317,7 @@ void setup() {
 #ifndef REAL_TEMP_SENSOR
     gTargetTempC = MockRoom::roomTempC;
     gPid.reset(MockRoom::roomTempC);
+    gDiffTune.reset(gPid.baseTuningForMode(gPid.mode()));
     Serial.printf("[MOCK] Season: %s | start=%.1f°C outside=%.1f°C target=%.1f°C (synced to room)\n",
                   MockRoom::kSeason == MockRoom::Season::WINTER ? "WINTER" : "SUMMER",
                   MockRoom::kStartTempC, MockRoom::kOutsideTempC, gTargetTempC);
@@ -324,6 +326,7 @@ void setup() {
     const float initialTempC = gTempSensor.readTemperatureC();
     gTargetTempC = initialTempC;
     gPid.reset(initialTempC);
+    gDiffTune.reset(gPid.baseTuningForMode(gPid.mode()));
     Serial.printf("[SENSOR] DS18B20 active. Initial temp: %.1f°C (target synced)\n", initialTempC);
 #endif
 
@@ -442,6 +445,7 @@ void loop() {
     if (gTargetTempC < -100.0f && roomTempC > -100.0f) {
         gTargetTempC = roomTempC;
         gPid.reset(roomTempC);
+        gDiffTune.resetTrial();
         Serial.printf("[SENSOR] Target synced to room: %.1f°C\n", roomTempC);
     }
 #endif
@@ -524,13 +528,20 @@ void loop() {
     // ── 5. Hub tick ───────────────────────────────────────────
     gHubClient.tick(nowMs, wallNow, gHubConnectivity.wifiConnected());
 
-    // ── 6. Adaptive tuning ────────────────────────────────────
-    const AdaptiveThermostatTuning::Overrides overrides = gAdaptive.update(
-        nowMs, roomTempC, gPid.mode(), gPid.baseTuningForMode(gPid.mode()));
+    // ── 6. DiffTune auto-tuning (kp, ki, kd) ──────────────────
+    // Re-seed from the mode's base gains whenever the mode changes.
+    if (gPid.mode() != gDiffTuneMode) {
+        gDiffTuneMode = gPid.mode();
+        gDiffTune.reset(gPid.baseTuningForMode(gPid.mode()));
+    }
+    const ThermostatTuning tuned = gDiffTune.tuning();
     PidThermostatController::RuntimeOverrides rtOverrides;
-    rtOverrides.enabled  = true;
-    rtOverrides.kp       = overrides.kp;
-    rtOverrides.maxSteps = overrides.maxSteps;
+    rtOverrides.enabled      = true;
+    rtOverrides.kp           = tuned.kp;
+    rtOverrides.maxSteps     = gPid.baseTuningForMode(gPid.mode()).maxSteps;
+    rtOverrides.overrideKiKd = true;
+    rtOverrides.ki           = tuned.ki;
+    rtOverrides.kd           = tuned.kd;
     gPid.setRuntimeOverrides(rtOverrides);
 
     // ── 7. PID tick (only when heater is on and auto-control enabled) ────
@@ -541,10 +552,20 @@ void loop() {
 
         if (pidResult.ranControlCycle) {
             Serial.printf("[PID] room=%.2f°C target=%.2f°C err=%+.2f "
-                          "P=%+.2f I=%+.3f D=%+.2f steps=%+d kp=%.2f maxSteps=%d\n",
+                          "P=%+.2f I=%+.3f D=%+.2f steps=%+d kp=%.2f ki=%.3f kd=%.2f maxSteps=%d\n",
                           roomTempC, gTargetTempC, pidResult.errorC,
                           pidResult.p, pidResult.i, pidResult.d, pidResult.steps,
-                          overrides.kp, overrides.maxSteps);
+                          tuned.kp, tuned.ki, tuned.kd, rtOverrides.maxSteps);
+
+            if (gDiffTune.onControlCycle(gTargetTempC, roomTempC, pidResult, gPid.config())) {
+                const auto& dt = gDiffTune.stats();
+                const ThermostatTuning nt = gDiffTune.tuning();
+                Serial.printf("[DIFFTUNE] trial=%lu loss=%.3f grad=(%+.3f,%+.3f,%+.3f) "
+                              "-> kp=%.2f ki=%.3f kd=%.2f | model g=%.5f lambda=%.5f\n",
+                              static_cast<unsigned long>(dt.trials), dt.lastTrialLoss,
+                              dt.lastGradKp, dt.lastGradKi, dt.lastGradKd,
+                              nt.kp, nt.ki, nt.kd, dt.modelGain, dt.modelLoss);
+            }
 
             gLogger.log(wallNow, LogEventType::THERMOSTAT_CONTROL, Command::NONE, true,
                         static_cast<uint8_t>(pidResult.steps < 0 ? 0 : pidResult.steps));
@@ -558,7 +579,6 @@ void loop() {
                 MockRoom::applySteps(pidResult.steps, gTargetTempC);
                 Serial.printf("[MOCK] heaterSetpoint now %.1f°C\n", MockRoom::heaterSetpointC);
 #endif
-                gAdaptive.onControlStepsSent(nowMs, roomTempC, pidResult.steps);
 
 #ifdef REAL_IR_TX
                 const Command irCmd = pidResult.steps > 0 ? Command::TEMP_UP : Command::TEMP_DOWN;
@@ -648,6 +668,7 @@ void loop() {
                 MockRoom::heaterSetpointC = gTargetTempC;
 #endif
                 gPid.reset(roomTempC);
+                gDiffTune.resetTrial();
                 onHeaterTurnedOn(nowMs, wallNow, roomTempC, gTargetTempC);
             } else {
                 gLastPidResult = {};
