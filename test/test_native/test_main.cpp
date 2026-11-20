@@ -1,4 +1,5 @@
 #include <unity.h>
+#include <cmath>
 #include <cstdio>
 #include <ctime>
 
@@ -6,6 +7,7 @@
 #define private public
 #include "IRReciever.h"
 #include "app/adaptive_thermostat_tuning.h"
+#include "app/difftune_thermostat_tuning.h"
 #include "app/retrofit_controller.h"
 #undef private
 #include "heater/heater.h"
@@ -670,6 +672,84 @@ void test_adaptive_tuning_uses_negative_steps_for_adaptation() {
 void setUp() {}
 void tearDown() {}
 
+// ── DiffTune (Cheng ... Hovakimyan, IEEE T-RO 2024) ─────────────────────────
+// Simulated first-order room driven by IR steps; returns final tuning + RMSE of the last episode.
+static ThermostatTuning runDiffTuneSim(const ThermostatTuning& start, int episodes, float* lastRmse) {
+    PidThermostatController::Config pc;
+    pc.controlIntervalMs = 60000U;
+    PidThermostatController pid(pc);
+    DiffTuneThermostatTuning tuner;
+    tuner.reset(start);
+    float roomC = 17.0F, heater = 0.0F;
+    uint32_t nowMs = 0U;
+    pid.reset(roomC);
+    for (int ep = 0; ep < episodes; ++ep) {
+        const float target = (ep % 2 == 0) ? 22.0F : 19.0F;
+        double sq = 0.0; int n = 0;
+        for (int k = 0; k < 120; ++k) {
+            const ThermostatTuning t = tuner.tuning();
+            PidThermostatController::RuntimeOverrides o;
+            o.enabled = true; o.kp = t.kp; o.maxSteps = 3;
+            o.overrideKiKd = true; o.ki = t.ki; o.kd = t.kd;
+            pid.setRuntimeOverrides(o);
+            const PidThermostatController::Result r = pid.tick(nowMs, target, roomC);
+            if (r.ranControlCycle) {
+                tuner.onControlCycle(target, roomC, r, pc);
+                heater += r.steps;
+                if (heater < 0.0F) heater = 0.0F;
+                if (heater > 30.0F) heater = 30.0F;
+                sq += (target - roomC) * (target - roomC); ++n;
+            }
+            for (int s = 0; s < 60; ++s) roomC += 0.0006F * heater - 0.0008F * (roomC - 5.0F);
+            nowMs += 60000U;
+        }
+        if (lastRmse) *lastRmse = static_cast<float>(std::sqrt(sq / (n > 0 ? n : 1)));
+    }
+    return tuner.tuning();
+}
+
+void test_difftune_raises_kp_when_controller_is_sluggish() {
+    float firstRmse = 0.0F, lastRmse = 0.0F;
+    runDiffTuneSim({0.4F, 0.002F, 0.0F, 3}, 1, &firstRmse);
+    const ThermostatTuning tuned = runDiffTuneSim({0.4F, 0.002F, 0.0F, 3}, 12, &lastRmse);
+    TEST_ASSERT_TRUE(tuned.kp > 0.4F);
+    TEST_ASSERT_TRUE(lastRmse < firstRmse);
+}
+
+void test_difftune_lowers_kp_when_controller_is_aggressive() {
+    const ThermostatTuning tuned = runDiffTuneSim({3.5F, 0.0F, 6.0F, 3}, 12, nullptr);
+    TEST_ASSERT_TRUE(tuned.kp < 3.5F);
+}
+
+void test_difftune_keeps_gains_inside_bounds() {
+    DiffTuneThermostatTuning::Config cfg;
+    const ThermostatTuning tuned = runDiffTuneSim({100.0F, 5.0F, -3.0F, 3}, 4, nullptr);
+    TEST_ASSERT_TRUE(tuned.kp >= cfg.kp.min && tuned.kp <= cfg.kp.max);
+    TEST_ASSERT_TRUE(tuned.ki >= cfg.ki.min && tuned.ki <= cfg.ki.max);
+    TEST_ASSERT_TRUE(tuned.kd >= cfg.kd.min && tuned.kd <= cfg.kd.max);
+}
+
+void test_difftune_identifies_heating_model() {
+    PidThermostatController::Config pc;
+    pc.controlIntervalMs = 60000U;
+    DiffTuneThermostatTuning tuner;
+    tuner.reset({1.0F, 0.0F, 0.0F, 3});
+    float roomC = 18.0F, heater = 0.0F;
+    for (int k = 0; k < 40; ++k) {
+        PidThermostatController::Result r;
+        r.ranControlCycle = true;
+        r.steps = static_cast<int8_t>((k % 5 == 0) ? 1 : 0);
+        r.errorC = 21.0F - roomC;
+        tuner.onControlCycle(21.0F, roomC, r, pc);
+        heater += r.steps;
+        roomC += 60.0F * (0.0005F * heater - 0.0010F * (roomC - 5.0F));
+    }
+    TEST_ASSERT_TRUE(tuner.modelReady());
+    TEST_ASSERT_FLOAT_WITHIN(0.0001F, 0.0005F, tuner.stats().modelGain);
+    TEST_ASSERT_FLOAT_WITHIN(0.0002F, 0.0010F, tuner.stats().modelLoss);
+}
+
+
 int main(int, char**) {
     UNITY_BEGIN();
 
@@ -694,6 +774,10 @@ int main(int, char**) {
     RUN_TEST(test_adaptive_tuning_does_not_adjust_before_window);
     RUN_TEST(test_adaptive_tuning_respects_kp_and_step_bounds);
     RUN_TEST(test_adaptive_tuning_uses_negative_steps_for_adaptation);
+    RUN_TEST(test_difftune_raises_kp_when_controller_is_sluggish);
+    RUN_TEST(test_difftune_lowers_kp_when_controller_is_aggressive);
+    RUN_TEST(test_difftune_keeps_gains_inside_bounds);
+    RUN_TEST(test_difftune_identifies_heating_model);
 
     return UNITY_END();
 }

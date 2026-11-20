@@ -37,12 +37,23 @@ public:
         float d = 0.0F;
         float output = 0.0F;
         int8_t steps = 0;
+        // Internal signals (used by DiffTune to differentiate through the controller).
+        float integral = 0.0F;        // integral accumulator after this cycle
+        float derivative = 0.0F;      // derivative signal before multiplying by kd
+        bool inDeadband = false;
+        bool integralClamped = false;
+        bool derivativeActive = false;
+        bool outputSaturated = false;  // |output| beyond +/- maxSteps
     };
 
     struct RuntimeOverrides {
         bool enabled = false;
         float kp = 0.0F;
         int8_t maxSteps = 1;
+        // When true, ki/kd below replace the mode's base ki/kd (DiffTune tunes all three).
+        bool overrideKiKd = false;
+        float ki = 0.0F;
+        float kd = 0.0F;
     };
 
     PidThermostatController();
@@ -51,6 +62,7 @@ public:
     void setMode(ThermostatMode mode);
     ThermostatMode mode() const;
     ThermostatTuning baseTuningForMode(ThermostatMode mode) const;
+    const Config& config() const { return config_; }
     void setRuntimeOverrides(const RuntimeOverrides& overrides);
     void clearRuntimeOverrides();
 
