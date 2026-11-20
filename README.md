@@ -15,6 +15,7 @@ An IoT system that thermoDevices legacy IR-controlled heaters (and other applian
 - [Running the Hub Server](#running-the-hub-server)
 - [First Boot & WiFi Provisioning](#first-boot--wifi-provisioning)
 - [Dashboard Usage](#dashboard-usage)
+- [PID Auto-Tuning (DiffTune)](#pid-auto-tuning-difftune)
 - [IR Learning Workflow](#ir-learning-workflow)
 - [Scheduling](#scheduling)
 - [API Reference](#api-reference)
@@ -129,7 +130,8 @@ ThermoDevice/
 ├── app/                        # Application logic
 │   ├── thermoDevice_controller.*   # Top-level orchestrator
 │   ├── pid_thermostat_controller.*  # PID control loop
-│   ├── adaptive_thermostat_tuning.* # Self-tuning PID
+│   ├── adaptive_thermostat_tuning.* # Legacy kp-only self-tuning
+│   ├── difftune_thermostat_tuning.* # DiffTune kp/ki/kd auto-tuning (active)
 │   └── room_temp_sensor.*      # Temperature sensor abstraction
 │
 ├── hub/                        # Hub communication
@@ -327,6 +329,89 @@ Access the dashboard at `http://<hub-ip>:5000` and log in with a device ID and p
 
 ---
 
+## PID Auto-Tuning (DiffTune)
+
+The firmware tunes **Kp, Ki and Kd automatically** while it runs, using the
+DiffTune method from Naira Hovakimyan's group at UIUC:
+
+> S. Cheng, M. Kim, L. Song, C. Yang, Y. Jin, S. Wang, N. Hovakimyan,
+> "DiffTune: Auto-Tuning through Auto-Differentiation," *IEEE Transactions on
+> Robotics*, 2024. [arXiv:2209.10021](https://arxiv.org/abs/2209.10021)
+
+DiffTune treats tuning as an optimisation problem: the closed loop (room +
+controller) is "unrolled" over time, and the controller gains are updated by
+gradient descent to minimise the tracking error.
+
+### How it works in ThermoDevice
+
+Code: `app/difftune_thermostat_tuning.h/.cpp`, wired into `thermohub/main.cpp`.
+
+1. **Room model (learned online).** Every control cycle a recursive least-squares
+   estimator fits a first-order model of the room:
+
+   ```
+   T[k+1] = T[k] + dt * (g * H[k] - λ * T[k] + c)     room temperature
+   H[k+1] = H[k] + u[k]                                heater level (sum of IR steps)
+   ```
+
+   `g` is how much one IR step heats the room, `λ` how fast the room loses heat.
+
+2. **Sensitivity propagation.** Along the *real measured* temperature trajectory,
+   the tuner propagates the sensitivities ∂state/∂(Kp, Ki, Kd) through the
+   model and through the PID equations (integral, derivative, deadband, step
+   clamp), as in the paper's eq. (6):
+
+   ```
+   dx[k+1]/dθ = (∂f/∂x + ∂f/∂u · ∂h/∂x) · dx[k]/dθ + ∂f/∂u · ∂h/∂θ
+   ```
+
+   Rounding to whole IR steps uses a straight-through gradient; the deadband,
+   integral clamp and step saturation give zero gradient.
+
+3. **Loss.** `L = Σ (target − room)² + ρ · Σ steps²`. The small effort term
+   (ρ = 0.01) discourages unnecessary IR commands.
+
+4. **Gradient step.** After each trial (default 30 control cycles) the gains take
+   one projected gradient-descent step. The gradient is scaled by each gain's
+   allowed range and normalised, so Kp (~1), Ki (~0.01) and Kd (~3) move
+   comparably. The gains are then clamped to their bounds.
+
+5. **Resets.** Switching FAST/ECO re-seeds DiffTune from that mode's base gains.
+   Turning the heater on or off starts a new trial but keeps the learned room model.
+
+### Configuration
+
+`DiffTuneThermostatTuning::Config` in `app/difftune_thermostat_tuning.h`:
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `trialCycles` | 30 | Control cycles per gradient step |
+| `learningRate` | 0.05 | Step size as a fraction of each gain's range |
+| `effortWeight` | 0.01 | Weight ρ of the IR-step effort term |
+| `rlsForgetting` | 0.995 | Forgetting factor of the room-model estimator |
+| `minModelSamples` | 10 | Samples needed before gradients are used |
+| `kp` / `ki` / `kd` | [0.3, 4] / [0, 0.1] / [0, 8] | Allowed gain ranges |
+
+One trial lasts `trialCycles × controlIntervalMs`. With the current 10 s
+interval that is 5 minutes; with a realistic 20 min interval it is 10 hours, so
+lower `trialCycles` if you want faster adaptation.
+
+### Serial output
+
+```
+[PID] room=19.80°C target=21.00°C err=+1.20 P=+1.10 I=+0.004 D=+0.00 steps=+1 kp=0.92 ki=0.004 kd=0.15 maxSteps=3
+[DIFFTUNE] trial=4 loss=1.274 grad=(-3.210,-0.842,+0.051) -> kp=1.03 ki=0.006 kd=0.14 | model g=0.00031 lambda=0.00072
+```
+
+### Results in simulation
+
+In a simulated room (first-order heat loss, 3-step max per cycle), DiffTune
+moves Kp to ≈0.8–1.0 from both a sluggish start (Kp = 0.4) and an aggressive
+start (Kp = 3.5, Kd = 6). The tracking RMSE drops from ≈2.2 °C to ≈0.7–0.8 °C.
+The remaining error comes from the 0.5 °C deadband and the whole-step IR actuator.
+
+---
+
 ## IR Learning Workflow
 
 The system learns IR codes from your existing physical remote so it can replay them:
@@ -463,6 +548,7 @@ Tests are located in `test/test_native/test_main.cpp` using the Unity test frame
 
 - **IR protocol**: NEC encode/decode, packet construction/validation, address matching
 - **PID controller**: Step output for various error conditions, integral anti-windup, deadband behavior
+- **DiffTune auto-tuning**: gains improve from sluggish and aggressive starts, stay within bounds, room model is identified correctly
 - **Scheduler**: Daily entries, weekday masking, deduplication, relative-once entries
 - **Hub client**: JSON parsing, telemetry serialization, command deserialization
 - **Time/clock**: Wall clock snapshots, mock clock injection
